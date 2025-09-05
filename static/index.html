@@ -1,0 +1,14 @@
+<!doctype html><meta charset="utf-8">
+<title>QA Tools</title>
+<h2>CSV dosyanı yükle</h2>
+<input type="file" id="f"><button id="btn">Gönder</button>
+<pre id="out"></pre>
+<script>
+btn.onclick = async () => {
+  const f = document.getElementById('f').files[0];
+  if (!f) return alert("Önce dosya seç");
+  const fd = new FormData(); fd.append('file', f);
+  const r = await fetch('/parse', { method:'POST', body: fd });
+  document.getElementById('out').textContent = JSON.stringify(await r.json(), null, 2);
+};
+</script>
