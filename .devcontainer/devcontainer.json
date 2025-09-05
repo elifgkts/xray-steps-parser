@@ -19,16 +19,16 @@
     pip3 install streamlit && echo '✅ Packages installed and Requirements met'",
 
   "postAttachCommand": {
-    "server": "streamlit run streamlit_app.py --server.address 0.0.0.0 --server.port 8501 --server.enableCORS false --server.enableXsrfProtection false"
+    "server": "streamlit run streamlit_app.py --server.address 0.0.0.0 --server.port 8888 --server.enableCORS false --server.enableXsrfProtection false"
   },
 
   "portsAttributes": {
-    "8501": {
+    "8888": {
       "label": "Application",
       "onAutoForward": "openPreview",
       "visibility": "public"
     }
   },
 
-  "forwardPorts": [8501]
+  "forwardPorts": [8888]
 }
