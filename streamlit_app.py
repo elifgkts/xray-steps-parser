@@ -1,6 +1,6 @@
 # streamlit_app.py
 # -*- coding: utf-8 -*-
-# xray-steps-parser v1.0 (+ collapse option)
+# xray-steps-parser v1.1 (+ collapse option & extra fields)
 
 """
 Streamlit – Xray Test Steps Parser (CSV → Flat Table)
@@ -8,11 +8,12 @@ Streamlit – Xray Test Steps Parser (CSV → Flat Table)
 Features
 - Upload ; (semicolon) separated CSV exported from Jira/Xray
 - Detect column: "Custom field (Manual Test Steps)" (case-insensitive contains)
+- Parses additional fields: Description, Labels, Pre-Conditions, Test Repository Path
 - Parse JSON array of steps → rows: Issue key, Summary, Step #, Action, Data, Expected Result
 - Add "Case #" numbering (per unique Issue key in input order)
 - Display interactive table, simple metrics
 - Download UTF-8 BOM CSV (Excel-friendly)
-- (New) Option to show Issue key & Summary only on the first row of each case
+- Option to show Issue key, Summary & extra fields only on the first row of each case
 
 Run
   streamlit run streamlit_app.py
@@ -84,16 +85,32 @@ def _clean_text(x: Any) -> str:
     return s
 
 
-def build_flat(df: pd.DataFrame, col_steps: str, col_key: str, col_sum: str) -> pd.DataFrame:
+def build_flat(df: pd.DataFrame, col_map: Dict[str, str]) -> pd.DataFrame:
     rows = []
     for _, r in df.iterrows():
-        key = r.get(col_key)
-        summ = r.get(col_sum)
-        steps = parse_manual_steps_cell(r.get(col_steps))
+        # Get values safely, defaulting to empty string if column is not found
+        key = r.get(col_map['key'], "") if col_map['key'] else ""
+        summ = r.get(col_map['sum'], "") if col_map['sum'] else ""
+        desc = r.get(col_map['desc'], "") if col_map['desc'] else ""
+        labels = r.get(col_map['labels'], "") if col_map['labels'] else ""
+        precond = r.get(col_map['precond'], "") if col_map['precond'] else ""
+        repo = r.get(col_map['repo'], "") if col_map['repo'] else ""
+        
+        steps_cell = r.get(col_map['steps'], "") if col_map['steps'] else ""
+        steps = parse_manual_steps_cell(steps_cell)
+        
+        base_info = {
+            "Issue key": key,
+            "Summary": summ,
+            "Description": desc,
+            "Labels": labels,
+            "Pre-Conditions": precond,
+            "Test Repository Path": repo
+        }
+
         if not steps:
             rows.append({
-                "Issue key": key,
-                "Summary": summ,
+                **base_info,
                 "Step #": None,
                 "Action": "",
                 "Data": "",
@@ -102,22 +119,27 @@ def build_flat(df: pd.DataFrame, col_steps: str, col_key: str, col_sum: str) -> 
         else:
             for s in steps:
                 rows.append({
-                    "Issue key": key,
-                    "Summary": summ,
+                    **base_info,
                     **s,
                 })
+                
     flat = pd.DataFrame(rows)
 
     # Case # numbering by first appearance order of Issue key
     order = pd.Categorical(flat["Issue key"], categories=pd.unique(flat["Issue key"]))
     flat = flat.assign(_ord=order)
     uniques = pd.unique(flat["Issue key"])  # preserves order
-    case_map = {k: i + 1 for i, k in enumerate([u for u in uniques if pd.notna(u)])}
+    case_map = {k: i + 1 for i, k in enumerate([u for u in uniques if pd.notna(u) and u != ""])}
     flat.insert(0, "Case #", flat["Issue key"].map(case_map))
     flat.drop(columns=["_ord"], errors="ignore", inplace=True)
 
     # Ensure consistent column order
-    flat = flat[["Case #", "Issue key", "Summary", "Step #", "Action", "Data", "Expected Result"]]
+    ordered_cols = [
+        "Case #", "Issue key", "Summary", "Description", "Labels", 
+        "Pre-Conditions", "Test Repository Path", 
+        "Step #", "Action", "Data", "Expected Result"
+    ]
+    flat = flat[ordered_cols]
     return flat
 
 
@@ -144,7 +166,7 @@ def df_to_csv_bom(df: pd.DataFrame, sep: str = ";") -> bytes:
 
 st.set_page_config(page_title="Xray Steps Parser", page_icon="✅", layout="wide")
 st.title("Xray Test Steps Parser")
-st.caption("CSV (noktalı virgül ; ile ayrılmış) → Ayrıştırılmış step tablosu + Case numaraları")
+st.caption("CSV (noktalı virgül ; ile ayrılmış) → Ayrıştırılmış step tablosu + Case numaraları ve Ek Alanlar")
 
 uploaded = st.file_uploader("CSV yükle (Jira'dan export edilmiş, ; ile ayrılmış)", type=["csv"])
 
@@ -162,38 +184,48 @@ except Exception:
 st.success(f"Yüklendi: {len(df_raw)} satır, {len(df_raw.columns)} sütun")
 
 # Detect columns
-col_steps = find_col(df_raw.columns.tolist(), "Manual Test Steps")
-col_key = find_col(df_raw.columns.tolist(), "Issue key") or find_col(df_raw.columns.tolist(), "Key")
-col_sum = find_col(df_raw.columns.tolist(), "Summary")
+cols_list = df_raw.columns.tolist()
+col_map = {
+    'steps': find_col(cols_list, "Manual Test Steps"),
+    'key': find_col(cols_list, "Issue key") or find_col(cols_list, "Key"),
+    'sum': find_col(cols_list, "Summary"),
+    'desc': find_col(cols_list, "Description"),
+    'labels': find_col(cols_list, "Labels"),
+    'precond': find_col(cols_list, "Pre-Conditions association"),
+    'repo': find_col(cols_list, "Test Repository Path")
+}
 
+# Only strictly require Steps, Key and Summary
 missing = []
-if not col_steps:
-    missing.append("Manual Test Steps")
-if not col_key:
-    missing.append("Issue key")
-if not col_sum:
-    missing.append("Summary")
+if not col_map['steps']: missing.append("Manual Test Steps")
+if not col_map['key']: missing.append("Issue key")
+if not col_map['sum']: missing.append("Summary")
 
 if missing:
-    st.error("Eksik sütun(lar): " + ", ".join(missing))
+    st.error("Zorunlu eksik sütun(lar): " + ", ".join(missing))
     st.stop()
 
 with st.expander("Sütun eşlemesi (otomatik algılandı)"):
     st.write({
-        "Manual Test Steps": col_steps,
-        "Issue key": col_key,
-        "Summary": col_sum,
+        "Manual Test Steps": col_map['steps'],
+        "Issue key": col_map['key'],
+        "Summary": col_map['sum'],
+        "Description": col_map['desc'] or "(Bulunamadı - Boş bırakılacak)",
+        "Labels": col_map['labels'] or "(Bulunamadı - Boş bırakılacak)",
+        "Pre-Conditions": col_map['precond'] or "(Bulunamadı - Boş bırakılacak)",
+        "Test Repository Path": col_map['repo'] or "(Bulunamadı - Boş bırakılacak)"
     })
 
-# Option: collapse repeated key/summary
-collapse_opt = st.checkbox("Issue key ve Summary sadece ilk satırda görünsün", value=True)
+# Option: collapse repeated key/summary/etc.
+collapse_opt = st.checkbox("Üst veri (Issue key, Summary, vb.) sadece ilk satırda görünsün", value=True)
 
 # Build flat table
-flat = build_flat(df_raw, col_steps, col_key, col_sum)
+flat = build_flat(df_raw, col_map)
 
 # Apply collapse (affects both table and downloads)
 if collapse_opt:
-    flat = collapse_repeats(flat, group_col="Issue key", cols_to_blank=["Issue key", "Summary"])
+    cols_to_blank = ["Issue key", "Summary", "Description", "Labels", "Pre-Conditions", "Test Repository Path"]
+    flat = collapse_repeats(flat, group_col="Issue key", cols_to_blank=cols_to_blank)
 
 # Simple metrics
 left, right = st.columns(2)
@@ -224,4 +256,4 @@ with colB:
     )
 
 st.caption("Not: CSV, Excel uyumu için UTF-8 BOM ile kaydedilir. Case #, inputtaki Issue key sırasına göre atanır. "
-           "‘Issue key & Summary’ çökertme seçeneği hem tabloda hem de indirilen CSV’de uygulanır.")
+           "Çökertme (collapse) seçeneği hem tabloda hem de indirilen CSV’de uygulanır.")
