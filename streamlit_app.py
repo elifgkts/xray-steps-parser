@@ -1,6 +1,6 @@
 # streamlit_app.py
 # -*- coding: utf-8 -*-
-# xray-steps-parser v1.2 (+ collapse option & multiple columns support)
+# xray-steps-parser v1.3 (+ collapse option & separate dynamic columns)
 
 """
 Streamlit – Xray Test Steps Parser (CSV → Flat Table)
@@ -9,7 +9,7 @@ Features
 - Upload ; (semicolon) separated CSV exported from Jira/Xray
 - Detect column: "Custom field (Manual Test Steps)" (case-insensitive contains)
 - Parses additional fields: Description, Test Repository Path
-- Parses multiple columns for Labels and Pre-Conditions (e.g., Labels, Labels.1, Labels.2) and joins them
+- Keeps multiple columns for Labels and Pre-Conditions separate (e.g., Labels, Labels.1)
 - Parse JSON array of steps → rows: Issue key, Summary, Step #, Action, Data, Expected Result
 - Add "Case #" numbering (per unique Issue key in input order)
 - Display interactive table, simple metrics
@@ -84,41 +84,34 @@ def _clean_text(x: Any) -> str:
     s = re.sub(r"\s+", " ", s, flags=re.UNICODE).strip()
     return s
 
-def _combine_multi_cols(row: pd.Series, cols: List[str]) -> str:
-    """Combine non-empty values from multiple columns into a comma-separated string."""
-    vals = []
-    for c in cols:
-        val = row.get(c)
-        if pd.notna(val) and str(val).strip():
-            vals.append(str(val).strip())
-    return ", ".join(vals)
-
 
 def build_flat(df: pd.DataFrame, col_map: Dict[str, Any]) -> pd.DataFrame:
     rows = []
     for _, r in df.iterrows():
-        # Get values safely for single columns
-        key = r.get(col_map['key'], "") if col_map['key'] else ""
-        summ = r.get(col_map['sum'], "") if col_map['sum'] else ""
-        desc = r.get(col_map['desc'], "") if col_map['desc'] else ""
-        repo = r.get(col_map['repo'], "") if col_map['repo'] else ""
-        
-        # Combine values for multiple columns (Labels and Pre-Conditions)
-        labels = _combine_multi_cols(r, col_map['labels'])
-        precond = _combine_multi_cols(r, col_map['precond'])
-        
-        steps_cell = r.get(col_map['steps'], "") if col_map['steps'] else ""
-        steps = parse_manual_steps_cell(steps_cell)
+        # Get single values safely
+        key = r.get(col_map['key'], "") if pd.notna(r.get(col_map['key'])) else ""
+        summ = r.get(col_map['sum'], "") if pd.notna(r.get(col_map['sum'])) else ""
+        desc = r.get(col_map['desc'], "") if pd.notna(r.get(col_map['desc'])) else ""
+        repo = r.get(col_map['repo'], "") if pd.notna(r.get(col_map['repo'])) else ""
         
         base_info = {
             "Issue key": key,
             "Summary": summ,
             "Description": desc,
-            "Labels": labels,
-            "Pre-Conditions": precond,
             "Test Repository Path": repo
         }
 
+        # Keep Labels as separate columns
+        for lbl_col in col_map['labels']:
+            base_info[lbl_col] = r.get(lbl_col, "") if pd.notna(r.get(lbl_col)) else ""
+
+        # Keep Pre-Conditions as separate columns
+        for prec_col in col_map['precond']:
+            base_info[prec_col] = r.get(prec_col, "") if pd.notna(r.get(prec_col)) else ""
+
+        steps_cell = r.get(col_map['steps'], "") if col_map['steps'] else ""
+        steps = parse_manual_steps_cell(steps_cell)
+        
         if not steps:
             rows.append({
                 **base_info,
@@ -136,6 +129,7 @@ def build_flat(df: pd.DataFrame, col_map: Dict[str, Any]) -> pd.DataFrame:
                 
     flat = pd.DataFrame(rows)
 
+    # Numbering
     order = pd.Categorical(flat["Issue key"], categories=pd.unique(flat["Issue key"]))
     flat = flat.assign(_ord=order)
     uniques = pd.unique(flat["Issue key"]) 
@@ -143,11 +137,12 @@ def build_flat(df: pd.DataFrame, col_map: Dict[str, Any]) -> pd.DataFrame:
     flat.insert(0, "Case #", flat["Issue key"].map(case_map))
     flat.drop(columns=["_ord"], errors="ignore", inplace=True)
 
-    ordered_cols = [
-        "Case #", "Issue key", "Summary", "Description", "Labels", 
-        "Pre-Conditions", "Test Repository Path", 
-        "Step #", "Action", "Data", "Expected Result"
-    ]
+    # Dynamic ordered columns to include all separate Labels and Pre-Conditions
+    ordered_cols = ["Case #", "Issue key", "Summary", "Description"]
+    ordered_cols.extend(col_map['labels'])
+    ordered_cols.extend(col_map['precond'])
+    ordered_cols.extend(["Test Repository Path", "Step #", "Action", "Data", "Expected Result"])
+    
     flat = flat[ordered_cols]
     return flat
 
@@ -172,7 +167,7 @@ def df_to_csv_bom(df: pd.DataFrame, sep: str = ";") -> bytes:
 
 st.set_page_config(page_title="Xray Steps Parser", page_icon="✅", layout="wide")
 st.title("Xray Test Steps Parser")
-st.caption("CSV (noktalı virgül ; ile ayrılmış) → Ayrıştırılmış step tablosu + Case numaraları ve Ek Alanlar")
+st.caption("CSV (noktalı virgül ; ile ayrılmış) → Ayrıştırılmış step tablosu + Case numaraları ve Ayrı Ek Sütunlar")
 
 uploaded = st.file_uploader("CSV yükle (Jira'dan export edilmiş, ; ile ayrılmış)", type=["csv"])
 
@@ -180,7 +175,7 @@ if uploaded is None:
     st.info("Örnek: Jira 'Export → CSV (All fields)' çıktısı. Sütun: 'Custom field (Manual Test Steps)'.")
     st.stop()
 
-# Read CSV (semicolon by default)
+# Read CSV
 try:
     df_raw = pd.read_csv(uploaded, sep=";", dtype=str, low_memory=False)
 except Exception:
@@ -188,7 +183,7 @@ except Exception:
 
 st.success(f"Yüklendi: {len(df_raw)} satır, {len(df_raw.columns)} sütun")
 
-# Detect columns
+# Detect columns dynamically
 cols_list = df_raw.columns.tolist()
 col_map = {
     'steps': find_col(cols_list, "Manual Test Steps"),
@@ -196,7 +191,6 @@ col_map = {
     'sum': find_col(cols_list, "Summary"),
     'desc': find_col(cols_list, "Description"),
     'repo': find_col(cols_list, "Test Repository Path"),
-    # Use find_multi_cols for fields that can appear multiple times
     'labels': find_multi_cols(cols_list, "Labels"),
     'precond': find_multi_cols(cols_list, "Pre-Conditions association")
 }
@@ -215,18 +209,22 @@ with st.expander("Sütun eşlemesi (otomatik algılandı)"):
         "Manual Test Steps": col_map['steps'],
         "Issue key": col_map['key'],
         "Summary": col_map['sum'],
-        "Description": col_map['desc'] or "(Bulunamadı - Boş bırakılacak)",
-        "Test Repository Path": col_map['repo'] or "(Bulunamadı - Boş bırakılacak)",
-        "Labels (Tüm eşleşenler)": ", ".join(col_map['labels']) if col_map['labels'] else "(Bulunamadı - Boş bırakılacak)",
-        "Pre-Conditions (Tüm eşleşenler)": ", ".join(col_map['precond']) if col_map['precond'] else "(Bulunamadı - Boş bırakılacak)"
+        "Description": col_map['desc'] or "(Bulunamadı)",
+        "Test Repository Path": col_map['repo'] or "(Bulunamadı)",
+        "Labels Sütunları": col_map['labels'] if col_map['labels'] else "(Bulunamadı)",
+        "Pre-Conditions Sütunları": col_map['precond'] if col_map['precond'] else "(Bulunamadı)"
     })
 
-collapse_opt = st.checkbox("Üst veri (Issue key, Summary, vb.) sadece ilk satırda görünsün", value=True)
+collapse_opt = st.checkbox("Üst veri (Issue key, Summary, Labels vb.) sadece ilk satırda görünsün", value=True)
 
+# Build the flat structure
 flat = build_flat(df_raw, col_map)
 
+# Apply collapse including dynamic columns
 if collapse_opt:
-    cols_to_blank = ["Issue key", "Summary", "Description", "Labels", "Pre-Conditions", "Test Repository Path"]
+    cols_to_blank = ["Issue key", "Summary", "Description", "Test Repository Path"]
+    cols_to_blank.extend(col_map['labels'])
+    cols_to_blank.extend(col_map['precond'])
     flat = collapse_repeats(flat, group_col="Issue key", cols_to_blank=cols_to_blank)
 
 left, right = st.columns(2)
@@ -253,6 +251,3 @@ with colB:
         file_name="manual_test_steps_numbered_utf8_comma.csv",
         mime="text/csv",
     )
-
-st.caption("Not: CSV, Excel uyumu için UTF-8 BOM ile kaydedilir. Case #, inputtaki Issue key sırasına göre atanır. "
-           "Çökertme (collapse) seçeneği hem tabloda hem de indirilen CSV’de uygulanır.")
