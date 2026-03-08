@@ -1,6 +1,6 @@
 # streamlit_app.py
 # -*- coding: utf-8 -*-
-# xray-steps-parser v1.1 (+ collapse option & extra fields)
+# xray-steps-parser v1.2 (+ collapse option & multiple columns support)
 
 """
 Streamlit – Xray Test Steps Parser (CSV → Flat Table)
@@ -8,7 +8,8 @@ Streamlit – Xray Test Steps Parser (CSV → Flat Table)
 Features
 - Upload ; (semicolon) separated CSV exported from Jira/Xray
 - Detect column: "Custom field (Manual Test Steps)" (case-insensitive contains)
-- Parses additional fields: Description, Labels, Pre-Conditions, Test Repository Path
+- Parses additional fields: Description, Test Repository Path
+- Parses multiple columns for Labels and Pre-Conditions (e.g., Labels, Labels.1, Labels.2) and joins them
 - Parse JSON array of steps → rows: Issue key, Summary, Step #, Action, Data, Expected Result
 - Add "Case #" numbering (per unique Issue key in input order)
 - Display interactive table, simple metrics
@@ -35,27 +36,27 @@ import streamlit as st
 # ---------------------------
 
 def find_col(cols: List[str], needle: str) -> str:
-    """Find a column whose name contains `needle` (case-insensitive)."""
+    """Find the FIRST column whose name contains `needle` (case-insensitive)."""
     needle_low = needle.lower()
     for c in cols:
         if needle_low in c.lower():
             return c
     return ""
 
+def find_multi_cols(cols: List[str], needle: str) -> List[str]:
+    """Find ALL columns whose names contain `needle` (case-insensitive)."""
+    needle_low = needle.lower()
+    return [c for c in cols if needle_low in c.lower()]
+
 
 def parse_manual_steps_cell(cell: Any) -> List[Dict[str, Any]]:
-    """Parse one cell from Manual Test Steps.
-    Expected JSON like: [ {"index":1, "fields":{"Action":"...","Data":"...","Expected Result":"..."}}, ... ]
-    Returns list of dicts with keys: Step #, Action, Data, Expected Result
-    """
+    """Parse one cell from Manual Test Steps."""
     if not isinstance(cell, str) or not cell.strip():
         return []
-    # Some exports may include stray whitespace or non-breaking space
     s = cell.strip().replace('\u00a0', ' ')
     try:
         arr = json.loads(s)
     except Exception:
-        # Some instances may use single quotes → try a relaxed fix
         try:
             s_relaxed = s.replace("'", '"')
             arr = json.loads(s_relaxed)
@@ -80,21 +81,31 @@ def parse_manual_steps_cell(cell: Any) -> List[Dict[str, Any]]:
 
 def _clean_text(x: Any) -> str:
     s = str(x) if x is not None else ""
-    # collapse whitespace
     s = re.sub(r"\s+", " ", s, flags=re.UNICODE).strip()
     return s
 
+def _combine_multi_cols(row: pd.Series, cols: List[str]) -> str:
+    """Combine non-empty values from multiple columns into a comma-separated string."""
+    vals = []
+    for c in cols:
+        val = row.get(c)
+        if pd.notna(val) and str(val).strip():
+            vals.append(str(val).strip())
+    return ", ".join(vals)
 
-def build_flat(df: pd.DataFrame, col_map: Dict[str, str]) -> pd.DataFrame:
+
+def build_flat(df: pd.DataFrame, col_map: Dict[str, Any]) -> pd.DataFrame:
     rows = []
     for _, r in df.iterrows():
-        # Get values safely, defaulting to empty string if column is not found
+        # Get values safely for single columns
         key = r.get(col_map['key'], "") if col_map['key'] else ""
         summ = r.get(col_map['sum'], "") if col_map['sum'] else ""
         desc = r.get(col_map['desc'], "") if col_map['desc'] else ""
-        labels = r.get(col_map['labels'], "") if col_map['labels'] else ""
-        precond = r.get(col_map['precond'], "") if col_map['precond'] else ""
         repo = r.get(col_map['repo'], "") if col_map['repo'] else ""
+        
+        # Combine values for multiple columns (Labels and Pre-Conditions)
+        labels = _combine_multi_cols(r, col_map['labels'])
+        precond = _combine_multi_cols(r, col_map['precond'])
         
         steps_cell = r.get(col_map['steps'], "") if col_map['steps'] else ""
         steps = parse_manual_steps_cell(steps_cell)
@@ -125,15 +136,13 @@ def build_flat(df: pd.DataFrame, col_map: Dict[str, str]) -> pd.DataFrame:
                 
     flat = pd.DataFrame(rows)
 
-    # Case # numbering by first appearance order of Issue key
     order = pd.Categorical(flat["Issue key"], categories=pd.unique(flat["Issue key"]))
     flat = flat.assign(_ord=order)
-    uniques = pd.unique(flat["Issue key"])  # preserves order
+    uniques = pd.unique(flat["Issue key"]) 
     case_map = {k: i + 1 for i, k in enumerate([u for u in uniques if pd.notna(u) and u != ""])}
     flat.insert(0, "Case #", flat["Issue key"].map(case_map))
     flat.drop(columns=["_ord"], errors="ignore", inplace=True)
 
-    # Ensure consistent column order
     ordered_cols = [
         "Case #", "Issue key", "Summary", "Description", "Labels", 
         "Pre-Conditions", "Test Repository Path", 
@@ -144,11 +153,9 @@ def build_flat(df: pd.DataFrame, col_map: Dict[str, str]) -> pd.DataFrame:
 
 
 def collapse_repeats(df: pd.DataFrame, group_col: str, cols_to_blank: List[str]) -> pd.DataFrame:
-    """Within each group (e.g., Issue key), blank out repeated cols after the first row."""
     if df.empty or group_col not in df.columns:
         return df
     out = df.copy()
-    # sort=False keeps original input order
     for _, idx in out.groupby(group_col, sort=False).groups.items():
         if len(idx) > 1:
             out.loc[idx[1:], cols_to_blank] = ""
@@ -157,7 +164,6 @@ def collapse_repeats(df: pd.DataFrame, group_col: str, cols_to_blank: List[str])
 
 def df_to_csv_bom(df: pd.DataFrame, sep: str = ";") -> bytes:
     csv_str = df.to_csv(index=False, sep=sep, encoding="utf-8-sig")
-    # to_csv already returns str; ensure bytes with BOM preserved
     return csv_str.encode("utf-8-sig")
 
 # ---------------------------
@@ -178,7 +184,6 @@ if uploaded is None:
 try:
     df_raw = pd.read_csv(uploaded, sep=";", dtype=str, low_memory=False)
 except Exception:
-    # Try auto-sep fallback
     df_raw = pd.read_csv(uploaded, dtype=str, low_memory=False)
 
 st.success(f"Yüklendi: {len(df_raw)} satır, {len(df_raw.columns)} sütun")
@@ -190,12 +195,12 @@ col_map = {
     'key': find_col(cols_list, "Issue key") or find_col(cols_list, "Key"),
     'sum': find_col(cols_list, "Summary"),
     'desc': find_col(cols_list, "Description"),
-    'labels': find_col(cols_list, "Labels"),
-    'precond': find_col(cols_list, "Pre-Conditions association"),
-    'repo': find_col(cols_list, "Test Repository Path")
+    'repo': find_col(cols_list, "Test Repository Path"),
+    # Use find_multi_cols for fields that can appear multiple times
+    'labels': find_multi_cols(cols_list, "Labels"),
+    'precond': find_multi_cols(cols_list, "Pre-Conditions association")
 }
 
-# Only strictly require Steps, Key and Summary
 missing = []
 if not col_map['steps']: missing.append("Manual Test Steps")
 if not col_map['key']: missing.append("Issue key")
@@ -211,23 +216,19 @@ with st.expander("Sütun eşlemesi (otomatik algılandı)"):
         "Issue key": col_map['key'],
         "Summary": col_map['sum'],
         "Description": col_map['desc'] or "(Bulunamadı - Boş bırakılacak)",
-        "Labels": col_map['labels'] or "(Bulunamadı - Boş bırakılacak)",
-        "Pre-Conditions": col_map['precond'] or "(Bulunamadı - Boş bırakılacak)",
-        "Test Repository Path": col_map['repo'] or "(Bulunamadı - Boş bırakılacak)"
+        "Test Repository Path": col_map['repo'] or "(Bulunamadı - Boş bırakılacak)",
+        "Labels (Tüm eşleşenler)": ", ".join(col_map['labels']) if col_map['labels'] else "(Bulunamadı - Boş bırakılacak)",
+        "Pre-Conditions (Tüm eşleşenler)": ", ".join(col_map['precond']) if col_map['precond'] else "(Bulunamadı - Boş bırakılacak)"
     })
 
-# Option: collapse repeated key/summary/etc.
 collapse_opt = st.checkbox("Üst veri (Issue key, Summary, vb.) sadece ilk satırda görünsün", value=True)
 
-# Build flat table
 flat = build_flat(df_raw, col_map)
 
-# Apply collapse (affects both table and downloads)
 if collapse_opt:
     cols_to_blank = ["Issue key", "Summary", "Description", "Labels", "Pre-Conditions", "Test Repository Path"]
     flat = collapse_repeats(flat, group_col="Issue key", cols_to_blank=cols_to_blank)
 
-# Simple metrics
 left, right = st.columns(2)
 with left:
     st.metric("Toplam Case", flat["Issue key"].replace("", pd.NA).nunique())
@@ -237,7 +238,6 @@ with right:
 st.subheader("Ayrıştırılmış Test Adımları")
 st.dataframe(flat, use_container_width=True)
 
-# Downloads
 colA, colB = st.columns(2)
 with colA:
     st.download_button(
@@ -247,7 +247,6 @@ with colA:
         mime="text/csv",
     )
 with colB:
-    # Optional: also provide comma-separated for non-TR tools
     st.download_button(
         label="CSV indir (UTF-8 BOM, , ile)",
         data=df_to_csv_bom(flat, sep=","),
