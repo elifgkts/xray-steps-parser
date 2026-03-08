@@ -1,6 +1,6 @@
 # streamlit_app.py
 # -*- coding: utf-8 -*-
-# xray-steps-parser v1.5 (+ Priority & Overall Expected Result)
+# xray-steps-parser v1.6 (PyArrow Duplicate Columns Fix)
 
 """
 Streamlit – Xray Test Steps Parser (CSV → Flat Table)
@@ -10,12 +10,11 @@ Features
 - Detect column: "Custom field (Manual Test Steps)"
 - Parses: Priority, Overall Expected Result, Description, Test Repository Path
 - STRICT matching for multiple columns (Labels, Pre-Conditions)
-- Keeps duplicate columns separate and renames them perfectly for Jira re-import
+- UI shows separate columns (Labels.1, Labels.2), but CSV exports clean headers (Labels, Labels) for Jira
 - Parse JSON array of steps → rows: Issue key, Summary, Step #, Action, Data, Expected Result
 - Add "Case #" numbering (per unique Issue key in input order)
 - Display interactive table, simple metrics
 - Download UTF-8 BOM CSV (Excel-friendly)
-- Option to show Issue key, Summary & extra fields only on the first row of each case
 """
 
 import io
@@ -53,11 +52,9 @@ def get_strict_cols(cols: List[str], needle: str) -> List[str]:
     if not base_col:
         return []
         
-    # Clean pandas suffix if present
     clean_base = re.sub(r'\.\d+$', '', base_col)
     escaped_base = re.escape(clean_base)
     
-    # Match exact base name or base name with .1, .2 suffix
     pattern = re.compile(rf"^{escaped_base}(\.\d+)?$")
     return [c for c in cols if pattern.match(c)]
 
@@ -117,11 +114,9 @@ def build_flat(df: pd.DataFrame, col_map: Dict[str, Any]) -> pd.DataFrame:
             "Test Repository Path": repo
         }
 
-        # Keep strictly matched Labels as separate columns
         for lbl_col in col_map['labels']:
             base_info[lbl_col] = r.get(lbl_col, "") if pd.notna(r.get(lbl_col)) else ""
 
-        # Keep strictly matched Pre-Conditions as separate columns
         for prec_col in col_map['precond']:
             base_info[prec_col] = r.get(prec_col, "") if pd.notna(r.get(prec_col)) else ""
 
@@ -145,7 +140,6 @@ def build_flat(df: pd.DataFrame, col_map: Dict[str, Any]) -> pd.DataFrame:
                 
     flat = pd.DataFrame(rows)
 
-    # Numbering
     order = pd.Categorical(flat["Issue key"], categories=pd.unique(flat["Issue key"]))
     flat = flat.assign(_ord=order)
     uniques = pd.unique(flat["Issue key"]) 
@@ -153,7 +147,6 @@ def build_flat(df: pd.DataFrame, col_map: Dict[str, Any]) -> pd.DataFrame:
     flat.insert(0, "Case #", flat["Issue key"].map(case_map))
     flat.drop(columns=["_ord"], errors="ignore", inplace=True)
 
-    # Dynamic ordered columns
     ordered_cols = ["Case #", "Issue key", "Priority", "Summary", "Description", "Overall Expected Result"]
     ordered_cols.extend(col_map['labels'])
     ordered_cols.extend(col_map['precond'])
@@ -191,7 +184,6 @@ if uploaded is None:
     st.info("Örnek: Jira 'Export → CSV (All fields)' çıktısı. Sütun: 'Custom field (Manual Test Steps)'.")
     st.stop()
 
-# Read CSV
 try:
     df_raw = pd.read_csv(uploaded, sep=";", dtype=str, low_memory=False)
 except Exception:
@@ -199,7 +191,6 @@ except Exception:
 
 st.success(f"Yüklendi: {len(df_raw)} satır, {len(df_raw.columns)} sütun")
 
-# Detect columns with STRICT regex logic
 cols_list = df_raw.columns.tolist()
 col_map = {
     'steps': find_col(cols_list, "Manual Test Steps"),
@@ -207,7 +198,7 @@ col_map = {
     'priority': find_col(cols_list, "Priority"),
     'sum': find_col(cols_list, "Summary"),
     'desc': find_col(cols_list, "Description"),
-    'overall_expected': find_col(cols_list, "Expected Result"), # Captures the overall test expected result
+    'overall_expected': find_col(cols_list, "Expected Result"),
     'repo': find_col(cols_list, "Test Repository Path"),
     'labels': get_strict_cols(cols_list, "Labels"),
     'precond': get_strict_cols(cols_list, "Pre-Conditions association")
@@ -237,27 +228,15 @@ with st.expander("Sütun eşlemesi (katı eşleşme ile algılandı)"):
 
 collapse_opt = st.checkbox("Üst veri (Issue key, Summary, Priority vb.) sadece ilk satırda görünsün", value=True)
 
-# Build the flat structure
 flat = build_flat(df_raw, col_map)
 
-# Apply collapse including strict dynamic columns
 if collapse_opt:
     cols_to_blank = ["Issue key", "Priority", "Summary", "Description", "Overall Expected Result", "Test Repository Path"]
     cols_to_blank.extend(col_map['labels'])
     cols_to_blank.extend(col_map['precond'])
     flat = collapse_repeats(flat, group_col="Issue key", cols_to_blank=cols_to_blank)
 
-# -------------------------------------------------------------
-# RENAME COLUMNS FOR EXPORT: Remove .1, .2 suffixes 
-# so Jira sees exactly multiple "Labels" columns
-# -------------------------------------------------------------
-rename_map = {}
-for col in col_map['labels'] + col_map['precond']:
-    clean_name = re.sub(r'\.\d+$', '', col)
-    rename_map[col] = clean_name
-
-flat_display = flat.rename(columns=rename_map)
-
+# UI'da göstermek için (Labels.1, Labels.2 şeklinde kalır, hata vermez)
 left, right = st.columns(2)
 with left:
     st.metric("Toplam Case", flat["Issue key"].replace("", pd.NA).nunique())
@@ -265,20 +244,32 @@ with right:
     st.metric("Toplam Step", (flat["Step #"].notna()).sum())
 
 st.subheader("Ayrıştırılmış Test Adımları")
-st.dataframe(flat_display, use_container_width=True)
+st.dataframe(flat, use_container_width=True) # Ekrana orijinalini basıyoruz
+
+# -------------------------------------------------------------
+# İNDİRME İÇİN SÜTUN İSİMLERİNİ JIRA FORMATINA ÇEVİRME
+# (.1, .2 gibi uzantıları silip aynı isimli sütunlar oluşturuyoruz)
+# -------------------------------------------------------------
+rename_map = {}
+for col in col_map['labels'] + col_map['precond']:
+    clean_name = re.sub(r'\.\d+$', '', col)
+    rename_map[col] = clean_name
+
+# İndirilecek veriyi kopyalayıp isimlerini temizliyoruz
+flat_export = flat.rename(columns=rename_map)
 
 colA, colB = st.columns(2)
 with colA:
     st.download_button(
         label="CSV indir (UTF-8 BOM, ; ile)",
-        data=df_to_csv_bom(flat_display, sep=";"),
+        data=df_to_csv_bom(flat_export, sep=";"),
         file_name="manual_test_steps_numbered_utf8.csv",
         mime="text/csv",
     )
 with colB:
     st.download_button(
         label="CSV indir (UTF-8 BOM, , ile)",
-        data=df_to_csv_bom(flat_display, sep=","),
+        data=df_to_csv_bom(flat_export, sep=","),
         file_name="manual_test_steps_numbered_utf8_comma.csv",
         mime="text/csv",
     )
